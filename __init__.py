@@ -28,7 +28,8 @@ from .gates          import GateLibrary
 from .qkmm           import QKMMMemory
 from .hamiltonian    import HamiltonianEvolver
 from .vm             import MFVirtualMachine
-from .parallel_state import BatchedAmplitudeState
+from .parallel_state import BatchedAmplitudeState 
+from .continuous_time_kde_nd   import ContinuousTimeKDE_nD
 
 __version__ = "0.1.0"
 __author__  = "Kai Cobbs / Divergence Lab"
@@ -41,4 +42,6 @@ __all__ = [
     "QKMMMemory",
     "HamiltonianEvolver",
     "BatchedAmplitudeState",
+    # Empirical field fitting
+    "ContinuousTimeKDE_nD",
 ]
