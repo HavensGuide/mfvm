@@ -199,14 +199,22 @@ class MFVirtualMachine:
     # ─────────────────────────────────────────────────────────
 
     def _reattach(self):
-        """Re-bind gate/query/hamiltonian subsystems after register resize."""
-        self.gate        = GateLibrary(self.state)
-        self.query       = QueryEngine(self.state)
-        self.hamiltonian = HamiltonianEvolver(
-            self.state,
-            dt=self.dt,
-            derivative_mode=self.derivative_mode,
-        )
+        """Re-bind gate/query/hamiltonian subsystems after register resize.
+
+        HamiltonianEvolver warns once at construction if state.mode='qubit_register'.
+        That warning is intentional on first construction (in __init__) but would
+        be noisy if repeated on every add_qubit/remove_qubit call. Suppress it here.
+        """
+        import warnings
+        self.gate  = GateLibrary(self.state)
+        self.query = QueryEngine(self.state)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.hamiltonian = HamiltonianEvolver(
+                self.state,
+                dt=self.dt,
+                derivative_mode=self.derivative_mode,
+            )
 
     def add_qubit(self, p0: float = 0.5):
         """Add a qubit in superposition (product state with existing register)."""
@@ -335,38 +343,62 @@ class MFVirtualMachine:
 
     def run_vqe(
         self,
-        V:             Union[torch.Tensor, Callable],
-        n_steps:       int   = 1000,
-        target_energy: float = None,
+        V:              Union[torch.Tensor, Callable],
+        n_steps:        int   = 1000,
+        target_energy:  float = None,
+        imaginary_time: bool  = False,
+        tol:            float = 1e-6,
     ) -> dict:
         """
-        Variational Quantum Eigensolver via Madelung evolution.
-        Evolves the state to minimize ⟨H⟩ = ⟨T + V + Q⟩.
+        Variational energy minimization via Madelung field evolution.
 
-        No shot noise. No gradient estimation. Direct fluid evolution.
-        Uses derivative_mode configured at VM construction time.
-        For best VQE accuracy, construct with derivative_mode='spectral'.
+        Two modes, selected by the `imaginary_time` flag:
+
+        imaginary_time=False (default) — real-time Hamiltonian evolution.
+            Integrates the Madelung PDEs (continuity + Hamilton-Jacobi) forward
+            in real time.  Energy is conserved (modulo numerical drift); the state
+            evolves but does not converge to the ground state.  Useful for
+            observing tunneling dynamics, wavepacket propagation, or generating
+            a trajectory rather than an eigenstate.
+
+        imaginary_time=True — imaginary-time ground-state projection.
+            Uses the split-operator method: exp(-H·dτ) applied to ψ at each step,
+            updating both ρ AND S.  Converges to the ground state.  Requires
+            state.mode='position_space' (or mode=None); raises RuntimeError if
+            state.mode='qubit_register'.  Use derivative_mode='spectral' at VM
+            construction for best accuracy.
+
+        For best VQE accuracy: MFVirtualMachine(..., derivative_mode='spectral')
+        and imaginary_time=True.
         """
         t0 = time.perf_counter()
-        history = self.hamiltonian.evolve(V=V, n_steps=n_steps, record_every=10)
-        t_ms = (time.perf_counter() - t0) * 1000
 
-        final_energy = self.hamiltonian.energy(V)
-        converged    = (
+        if imaginary_time:
+            history = self.hamiltonian.imaginary_time_evolve(
+                n_steps=n_steps, V=V, record_every=10, tol=tol,
+            )
+            final_energy = history[-1]["energy"] if history else self.hamiltonian.energy(V)
+        else:
+            history = self.hamiltonian.evolve(V=V, n_steps=n_steps, record_every=10)
+            final_energy = self.hamiltonian.energy(V)
+
+        t_ms = (time.perf_counter() - t0) * 1000
+        converged = (
             target_energy is not None
             and abs(final_energy - target_energy) / (abs(target_energy) + EPS) < 0.01
         )
 
         return {
-            "final_energy":  final_energy,
-            "target_energy": target_energy,
-            "converged":     converged,
-            "error_%":       (abs(final_energy - target_energy)
-                              / (abs(target_energy) + EPS) * 100
-                              if target_energy is not None else None),
-            "time_ms":       t_ms,
-            "n_steps":       n_steps,
-            "history":       history,
+            "final_energy":   final_energy,
+            "target_energy":  target_energy,
+            "converged":      converged,
+            "imaginary_time": imaginary_time,
+            "error_%":        (abs(final_energy - target_energy)
+                               / (abs(target_energy) + EPS) * 100
+                               if target_energy is not None else None),
+            "time_ms":        t_ms,
+            "n_steps":        n_steps,
+            "history":        history,
         }
 
     # ─────────────────────────────────────────────────────────
@@ -450,7 +482,17 @@ class MFVirtualMachine:
             print(f"  S_ent(0,1):  {ee:.4f}")
 
         if mode == 'A':
-            # Position-space quantities — only meaningful for mode-A (periodic grid) states
+            # Position-space quantities — only meaningful for mode-A (periodic grid) states.
+            # Guard: if state.mode is explicitly 'qubit_register', quantum_potential
+            # and osmotic_velocity will raise RuntimeError regardless of the local
+            # mode flag.  Fall through to mode B output in that case.
+            state_mode = getattr(self.state, 'mode', None)
+            if state_mode == 'qubit_register':
+                print(f"  [NOTE] derivative_mode='spectral' but state.mode='qubit_register'.")
+                print(f"         Skipping position-space quantities — reporting mode B instead.")
+                mode = 'B'
+
+        if mode == 'A':
             E_kin_proxy = float(torch.sum(self.state.rho * self.state.quantum_potential))
             print(f"  <Q>:         {E_kin_proxy:.4f}  (quantum pressure, mode A only)")
             print(f"  Osmotic v:   {float(self.state.osmotic_velocity.abs().mean()):.4f}  (mean |u|, mode A only)")

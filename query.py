@@ -159,7 +159,9 @@ class QueryEngine:
             return self.state.rho.clone()
         else:
             rdm = self.state.reduced_density_matrix(qubit_idx)
-            return torch.diag(rdm)
+            # rdm is complex64 (Hermitian); diagonal entries are real-valued
+            # probabilities by construction — extract real part explicitly
+            return torch.diag(rdm).real.float()
 
     def sample(self, n_shots: int = 1024, qubit_idx: Optional[int] = None) -> torch.Tensor:
         """
@@ -204,8 +206,13 @@ class QueryEngine:
         Z = torch.tensor([[1, 0], [0, -1]], dtype=torch.complex64, device=self.device)
         X = torch.tensor([[0, 1], [1,  0]], dtype=torch.complex64, device=self.device)
         s = 1.0 / (2.0 ** 0.5)
-        B_mat  = s * (Z + X)   # (Z+X)/√2
-        Bp_mat = s * (Z - X)   # (Z-X)/√2
+        B_mat  = s * (Z + X)    # (Z+X)/√2  — b  = π/4
+        Bp_mat = s * (X - Z)    # (X-Z)/√2  — b' = 3π/4
+        # NOTE: Bp_mat = (X-Z)/√2, NOT (Z-X)/√2.
+        # With A=Z, A'=X, B=(Z+X)/√2, the formula |AB - AB' + A'B + A'B'|
+        # reaches its quantum maximum 2√2 for |Φ+⟩ and |Ψ-⟩ only when B'
+        # has the opposite sign from B on the Z component.  Using (Z-X)/√2
+        # makes AB = AB', so the AB - AB' term cancels and CHSH collapses to 0.
 
         def two_qubit_corr(O_i: torch.Tensor, O_j: torch.Tensor) -> float:
             """
