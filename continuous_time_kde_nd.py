@@ -355,25 +355,40 @@ class ContinuousTimeKDE_nD:
 
         for s in range(0, G, batch_size):
             e = min(s + batch_size, G)
-            q = Q[s:e]
+            q = Q[s:e]                          # (B, N)
 
-            dx = q.unsqueeze(1) - X_sub.unsqueeze(0)    # (B, M, N)
-            prec_dx = dx @ precision                      # (B, M, N)
-            dist_sq = (dx * prec_dx).sum(-1)              # (B, M)
+            # Build (B, M) distance without ever allocating (B, M, N)
+            dist_sq = torch.zeros(e-s, len(w_norm), device=self.device)
+            prec_dx_dims = []                   # store (B, M) slices for grad
+
+            for _d in range(self.n_dim):
+                dx_d = q[:, _d].unsqueeze(1) - X_sub[:, _d].unsqueeze(0)  # (B, M)
+                # prec_dx[..., _d] = sum_j dx_j * precision[j, _d]
+                pd_d = sum(
+                    (q[:, _j].unsqueeze(1) - X_sub[:, _j].unsqueeze(0))
+                    * precision[_j, _d]
+                    for _j in range(self.n_dim)
+                )
+                dist_sq += dx_d * pd_d
+                prec_dx_dims.append(pd_d)       # (B, M) — cheap
+                del dx_d
 
             kern = torch.exp(-0.5 * dist_sq)
+            del dist_sq
             wk = kern * w_norm.unsqueeze(0)
+            del kern
 
             rho_chunk = wk.sum(1)
             rho_out[s:e] = rho_chunk
 
-            # grad_rho_j = -sum_i w_i k_i (Sigma^{-1} dx)_j
-            grad_out[s:e] = -(wk.unsqueeze(2) * prec_dx).sum(1)
+            for _d in range(self.n_dim):
+                grad_out[s:e, _d] = -(wk * prec_dx_dims[_d]).sum(1)
+            del prec_dx_dims
 
             term1 = (wk * grad_w_factor.unsqueeze(0)).sum(1)
             pdot_out[s:e] = term1 - rho_chunk * norm_drift
-
-            del dx, prec_dx, dist_sq, kern, wk, rho_chunk, term1
+            del wk, rho_chunk, term1
+            torch.cuda.empty_cache()
 
         rho_np = rho_out.cpu().numpy() * norm_const
         grad_np = grad_out.cpu().numpy() * norm_const

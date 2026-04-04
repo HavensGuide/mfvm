@@ -23,6 +23,7 @@ end of the gate.  Every gate in this file follows that contract.
 
 import torch
 import numpy as np
+from typing import Union, Callable, Optional, List, Tuple
 from .state import MadelungState, EPS
 
 
@@ -308,8 +309,6 @@ class GateLibrary:
           Tensor mask (recommended for GPU workloads):
             Pass a pre-computed boolean tensor of shape (dim,).
             Oracle cost is O(1) — a single GPU scatter write.
-            This is what makes the O(√N) Grover advantage real in wall-clock time.
-
                 mask = compute_all_hits_in_parallel(...)   # your vectorized test
                 t = gate.function_oracle(mask)
 
@@ -452,3 +451,74 @@ class GateLibrary:
         top_idx = torch.argsort(rho, descending=True)
         marked  = top_idx[:max(t, 1)].cpu().tolist()
         return marked, t, oracle_calls
+    
+    def amplitude_search(
+        self,
+        oracle:      Union[torch.Tensor, Callable],
+        n_iter:      int           = 1,
+        valid_range: int           = None,
+        top_k:       int           = 1,
+    ) -> dict:
+        """
+        MFVM amplitude search: oracle + diffusion for n_iter steps,
+        then full non-destructive readout of ρ.
+
+        Unlike grover_search_f, this never collapses the state — ρ is read
+        directly without measurement. No counting step is needed: the full
+        probability distribution over all candidates is returned after every
+        call, and the caller verifies or ranks top-k results directly.
+
+        This is impossible on physical quantum hardware (measurement collapses
+        the wavefunction). On MFVM, non-destructive readout is free — ρ is
+        always available and reading it never modifies S.
+
+        Why this is often better than grover_search_f on MFVM:
+        - No counting step (saves 1 oracle call when t is unknown)
+        - Returns ranked distribution, not a sampled index — caller gets
+            all information from the amplitude field, not a single draw
+        - n_iter=1 is frequently sufficient when the oracle is informative;
+            increasing n_iter sharpens contrast at the cost of more oracle calls
+
+        Parameters
+        ──────────
+        oracle:      (dim,) or (valid_range,) bool tensor — pre-computed mask
+                    (O(1) GPU scatter), or callable f(i) → bool (O(dim) loop,
+                    use only for small problems or debugging).
+        n_iter:      number of oracle + diffusion rounds (default 1).
+        valid_range: restrict search to indices [0, valid_range). Defaults to
+                    state.dim. Use when 2^n_qubits > actual problem size.
+        top_k:       number of top candidates to return (default 1).
+
+        Returns
+        ───────
+        dict with keys:
+        rho          : (valid_range,) float32 tensor — full probability field
+        top_indices  : (top_k,) int list — highest-probability candidate indices
+        top_probs    : (top_k,) float list — corresponding probabilities
+        oracle_calls : int — number of oracle+diffusion rounds executed
+        """
+        dim    = self.state.dim
+        vrange = valid_range or dim
+
+        # Uniform superposition over valid candidates only
+        rho_init           = torch.zeros(dim, dtype=torch.float32, device=self.device)
+        rho_init[:vrange]  = 1.0 / vrange
+        self.state.rho     = rho_init
+        self.state.S       = torch.zeros(dim, dtype=torch.float32, device=self.device)
+
+        for _ in range(n_iter):
+            self.function_oracle(oracle)
+            self.grover_diffusion()
+
+        # Non-destructive readout — never collapses state
+        rho      = self.state.rho[:vrange]
+        top_idx  = torch.argsort(rho, descending=True)[:top_k]
+        top_idxs = top_idx.cpu().tolist()
+        top_prbs = rho[top_idx].cpu().tolist()
+
+        return {
+            "rho":          rho.cpu(),
+            "top_indices":  top_idxs,
+            "top_probs":    top_prbs,
+            "oracle_calls": n_iter,
+        }

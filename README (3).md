@@ -108,7 +108,7 @@ import torch
 
 # 1024 independent registers over 200 candidates each
 state = BatchedAmplitudeState(n_registers=1024, dim=256)
-state.init_uniform(N=200)
+state.init_uniform(200)
 
 # Boolean oracle: shape (1024, 200) or (1024, 256) bool
 mask = compute_oracle_mask(...)   # your vectorized test
@@ -148,6 +148,33 @@ result = vm.run_search(target=42, n_qubits=8)
 vm.save()
 ```
 
+### Amplitude Search (GateLibrary)
+
+```python
+from mfvm import MFVirtualMachine
+import torch
+
+vm = MFVirtualMachine(n_qubits=8)   # 256-element search space
+
+# Pre-computed boolean mask — O(1) GPU scatter oracle
+mask = torch.zeros(256, dtype=torch.bool)
+mask[[42, 117, 200]] = True          # mark targets
+
+result = vm.gate.amplitude_search(mask, n_iter=1, top_k=3)
+# result['rho']          — full (256,) probability field, non-destructive
+# result['top_indices']  — [42, 117, 200] ranked by amplitude
+# result['top_probs']    — corresponding probabilities
+# result['oracle_calls'] — 1
+
+# Unlike Grover, the full ρ distribution is always available after every step —
+# no measurement collapse, no shot noise, no counting step required.
+# Caller verifies or re-ranks top candidates directly from the amplitude field.
+#
+# Note: this advantage is specific to MFVM as a classical simulator.
+# On physical quantum hardware, measurement collapses the wavefunction
+# and the full ρ distribution is not accessible.
+```
+
 ### Amplitude-Encoded Matrix Memory (QKMM)
 
 ```python
@@ -168,6 +195,14 @@ result = mem.query(B3)
 B_batch = torch.randn(8, 64, 128)
 results = mem.query_batched(B_batch)   # (8, 256, 64)
 
+# Top-k via amplitude search — beats full query() when k << M
+# Phase 1: coarse oracle over M rows via amplitude field  — O(M·G)
+# Phase 2: exact re-score of top candidates only          — O(k·N) vs O(M·N)
+result = mem.query_topk(B, k=8)
+# result['indices']  — (K, k) top row indices into A per query
+# result['scores']   — (K, k) exact inner product scores
+# result['rho']      — (K, M) full amplitude field (non-destructive readout)
+
 # Benchmark: amortized cost vs classical matmul
 report = mem.benchmark(M=256, N=128, K=256)
 print(f"Break-even at Q={report['breakeven_Q']:.1f} queries")
@@ -186,6 +221,8 @@ print(f"Break-even at Q={report['breakeven_Q']:.1f} queries")
 │  H, CNOT, T  │ step / evolve    │  expectation          │
 │  QFT, Grover │ imag_time_evolve │  chsh_value           │
 │  Bell, GHZ   │ ground_state_E   │  measure_probs        │
+│  amplitude_  │                  │                       │
+│  search      │                  │                       │
 ├──────────────┴──────────────────┴───────────────────────┤
 │  MadelungState              BatchedAmplitudeState       │
 │  (ρ, S) single register     (ρ, S) × R registers        │
@@ -193,6 +230,7 @@ print(f"Break-even at Q={report['breakeven_Q']:.1f} queries")
 ├─────────────────────────────────────────────────────────┤
 │  QKMMMemory                                             │
 │  Amplitude-encoded matrix — write once, query many      │
+│  query / query_batched / query_topk                     │
 ├─────────────────────────────────────────────────────────┤
 │  GPU LAYER — PyTorch / CUDA                             │
 │  FFT · bmm · svd · scatter — all native tensor ops      │
@@ -238,8 +276,8 @@ The following are confirmed to produce correct results on CPU and CUDA:
 
 | Circuit | Validation |
 |---------|------------|
-| Bell state |Φ+⟩ = (|00⟩+|11⟩)/√2, CHSH > 2√2 |
-| GHZ state | (|000⟩+|111⟩)/√2 for N qubits |
+| Bell state | \|Φ+⟩ = (\|00⟩+\|11⟩)/√2, CHSH > 2√2 |
+| GHZ state | (\|000⟩+\|111⟩)/√2 for N qubits |
 | QFT | n-qubit quantum Fourier transform |
 | Grover search | single and multi-target, with function oracle |
 | Harmonic oscillator ground state | E0 → ħω/2 under imaginary-time projection |
@@ -248,7 +286,7 @@ The following are confirmed to produce correct results on CPU and CUDA:
 
 ## Citation
 
-If you use MFVM in research, please cite the companion paper:
+If you use MFVM in research, please cite the foundational paper, where it was utilized in an economic setting:
 
 > Cobbs, K. (2025). *The Dissipative Structure of Value: Madelung Flow Regression Applied to NYC Residential Real Estate.* SSRN Working Paper. https://doi.org/10.2139/ssrn.5975594
 

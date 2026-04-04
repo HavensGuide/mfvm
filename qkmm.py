@@ -402,6 +402,144 @@ class QKMMMemory:
         norms_A_s = self.norms_A.unsqueeze(0).unsqueeze(2)     # (1, M, 1)
         norms_B_s = norms_B.squeeze(2).unsqueeze(1)            # (n_q, 1, K)
         return overlap * norms_A_s * norms_B_s                 # (n_q, M, K)
+    
+    def query_topk(
+        self,
+        B:             torch.Tensor,
+        k:             int   = 1,
+        n_iter:        int   = 1,
+        exact_rescore: bool  = True,
+        threshold:     float = None,
+    ) -> dict:
+        """
+        Top-k query via amplitude search + optional exact re-score.
+
+        Two-phase approach:
+        1. Coarse pass — amplitude search over M rows of A using a low-rank
+            oracle (sign of inner product in G-dimensional projection space).
+            Cost: O(M·G) oracle + O(M) diffusion, repeated n_iter times.
+            G << N in approximate mode; G = N in exact mode (same as query()).
+
+        2. Exact re-score (default on) — compute precise inner products only
+            for the top-k·oversample candidates surfaced by the amplitude field.
+            Cost: O(k·oversample·N) instead of O(M·N).
+
+        Break-even: query_topk wins when k << M. At k=M it degrades to query().
+
+        Parameters
+        ──────────
+        B:             (K, N) query batch
+        k:             number of top rows of A to return per query (default 1)
+        n_iter:        oracle + diffusion rounds (default 1; increase to sharpen
+                    amplitude contrast at the cost of more oracle passes)
+        exact_rescore: if True, re-score top candidates with exact inner products
+                    and re-rank. Set False to return amplitude-field ranking
+                    directly (faster, slightly lower precision).
+        threshold:     oracle threshold on coarse score (default: mean score per
+                    query). Rows above threshold are phase-flipped. Lower
+                    threshold → more candidates marked → broader top-k recall.
+
+        Returns
+        ───────
+        dict with keys:
+        indices     : (K, k) int tensor  — top-k row indices into A per query
+        scores      : (K, k) float tensor — corresponding inner product scores
+        rho         : (K, M) float tensor — full amplitude field after search
+        oracle_calls: int — n_iter (oracle+diffusion rounds executed)
+        """
+        if self.psi_A is None:
+            raise RuntimeError("Call encode() before query_topk().")
+
+        K, N = B.shape
+        assert N == self.N, f"Column mismatch: encoded N={self.N}, query N={N}"
+        M = self.M
+
+        B_t     = B.to(self.device).float()
+        norms_B = torch.norm(B_t, dim=1, keepdim=True) + EPS   # (K, 1)
+        B_n     = B_t / norms_B                                 # (K, N)
+
+        # ── Phase 1: Coarse scores via encoded projection ─────────────────────
+        # psi_A: (M, G), psi_B: (K, G) — cheap inner products in G-dim space.
+        # In exact mode G=N so this is full precision; in approximate mode G<<N.
+        psi_B        = self._project_B(B_n)                     # (K, G)
+        coarse_scores = self._overlap(self.psi_A, psi_B)        # (M, K)
+        coarse_scores = coarse_scores.T                         # (K, M)
+
+        # ── Phase 2: Amplitude search over M rows ─────────────────────────────
+        # Uniform superposition over M rows as a (K, M) field.
+        # Oracle phase-flips rows whose coarse score exceeds the threshold.
+        # Diffusion (inversion about mean) amplifies marked candidates.
+        # All K queries processed in parallel — one batched kernel per step.
+
+        rho = torch.full((K, M), 1.0 / M, dtype=torch.float32, device=self.device)
+        S   = torch.zeros((K, M),          dtype=torch.float32, device=self.device)
+
+        for _ in range(n_iter):
+            # Oracle: boolean mask per query — rows above threshold get +π phase
+            thresh = threshold if threshold is not None else coarse_scores.mean(dim=1, keepdim=True)
+            mask   = coarse_scores > thresh                     # (K, M) bool
+            S[mask] += torch.pi
+
+            # Diffusion: ψ_new = 2·μ − ψ, μ = mean over M candidates
+            psi    = torch.sqrt(rho) * torch.exp(1j * S.to(torch.complex64))
+            mu     = psi.mean(dim=1, keepdim=True)              # (K, 1) complex
+            psi    = 2 * mu - psi                               # inversion about mean
+            rho    = psi.abs().square()
+            rho    = rho / (rho.sum(dim=1, keepdim=True) + EPS) # renormalize
+
+            S = psi.angle().float()
+
+        # ── Phase 3: Top-k from amplitude field ───────────────────────────────
+        # Oversample by 4× then re-rank to improve recall at boundary.
+        oversample   = min(k * 4, M)
+        topk_coarse  = torch.topk(rho, oversample, dim=1)       # (K, oversample)
+        cand_indices = topk_coarse.indices                       # (K, oversample)
+
+        if not exact_rescore:
+            final_indices = cand_indices[:, :k]
+            final_scores  = coarse_scores.gather(1, final_indices)
+            return {
+                "indices":      final_indices.cpu(),
+                "scores":       final_scores.cpu(),
+                "rho":          rho.cpu(),
+                "oracle_calls": n_iter,
+            }
+
+        # ── Phase 4: Exact re-score top candidates only ───────────────────────
+        # Gather encoded rows for each query's candidates — no full bmm.
+        # psi_A: (M, G) → gather (K, oversample, G) → batched dot with psi_B
+        psi_A_exp   = self.psi_A.unsqueeze(0).expand(K, -1, -1)         # (K, M, G)
+        cand_psi_A  = psi_A_exp.gather(
+            1,
+            cand_indices.unsqueeze(-1).expand(-1, -1, self.G)
+        )                                                                 # (K, oversample, G)
+
+        psi_B_exp   = psi_B.unsqueeze(1)                                 # (K, 1, G)
+        if self._use_real_active:
+            exact = torch.bmm(cand_psi_A, psi_B_exp.transpose(1, 2))    # (K, oversample, 1)
+        else:
+            exact = torch.bmm(
+                cand_psi_A, psi_B_exp.conj().transpose(1, 2)
+            ).real                                                        # (K, oversample, 1)
+
+        exact = exact.squeeze(-1)                                        # (K, oversample)
+
+        # Scale by norms to recover true inner product magnitudes
+        cand_norms_A = self.norms_A.unsqueeze(0).expand(K, -1).gather(1, cand_indices)
+        exact        = exact * cand_norms_A * norms_B                    # (K, oversample)
+
+        # Re-rank and take top-k
+        topk_exact    = torch.topk(exact, k, dim=1)
+        local_indices = topk_exact.indices                               # (K, k)
+        final_indices = cand_indices.gather(1, local_indices)            # (K, k) into A
+        final_scores  = topk_exact.values                                # (K, k)
+
+        return {
+            "indices":      final_indices.cpu(),
+            "scores":       final_scores.cpu(),
+            "rho":          rho.cpu(),
+            "oracle_calls": n_iter,
+        }
 
     # ─────────────────────────────────────────────────────────
     # Classical baseline
