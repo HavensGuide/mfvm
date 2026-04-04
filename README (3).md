@@ -29,7 +29,7 @@ The quantum simulation capabilities remain fully intact and are validated (Bell 
 ## Installation
 
 ```bash
-git clone https://github.com/HavensGuide/DissipativeValue
+git clone https://github.com/HavensGuide/mfvm
 cd DissipativeValue
 pip install -e .
 ```
